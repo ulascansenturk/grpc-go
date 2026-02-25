@@ -1404,73 +1404,67 @@ func (s) TestRPCSpanErrorStatus(t *testing.T) {
 
 const delayedResolutionEventName = "Delayed name resolution complete"
 
-// blockingPicker always returns ErrNoSubConnAvailable and signals when Pick
-// has been called. This ensures the pick method in picker_wrapper.go blocks
-// and sets pickBlocked=true before the ready picker is produced.
+// blockingPicker returns ErrNoSubConnAvailable and fires an event when Pick
+// is called. Uses grpcsync.Event which is safe for concurrent calls to Pick.
 type blockingPicker struct {
-	pickCalled chan struct{}
-	once       sync.Once
+	pickCalled *grpcsync.Event
 }
 
 func (p *blockingPicker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
-	p.once.Do(func() { close(p.pickCalled) })
+	p.pickCalled.Fire()
 	return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
 }
 
-// readyPicker returns the provided SubConn on every Pick call.
-type readyPicker struct {
-	sc balancer.SubConn
+// blockingBalancerCCWrapper wraps a balancer.ClientConn to intercept
+// UpdateState calls from pickfirst. It ensures a blocking picker is pushed
+// first and delays the ready picker until Pick has been called on the
+// blocking picker.
+type blockingBalancerCCWrapper struct {
+	balancer.ClientConn
+	bp   *blockingPicker
+	once sync.Once
 }
 
-func (p *readyPicker) Pick(balancer.PickInfo) (balancer.PickResult, error) {
-	return balancer.PickResult{SubConn: p.sc}, nil
+func (w *blockingBalancerCCWrapper) UpdateState(state balancer.State) {
+	// Push the blocking picker on the first UpdateState call from pickfirst.
+	w.once.Do(func() {
+		w.ClientConn.UpdateState(balancer.State{
+			ConnectivityState: connectivity.Connecting,
+			Picker:            w.bp,
+		})
+	})
+	if state.ConnectivityState == connectivity.Ready {
+		// Wait for pick() to call Pick() on the blocking picker before
+		// forwarding the ready state from pickfirst. This ensures
+		// pickBlocked is set in picker_wrapper.go.
+		go func() {
+			<-w.bp.pickCalled.Done()
+			w.ClientConn.UpdateState(state)
+		}()
+	}
 }
 
-// registerBlockingBalancer registers a stub balancer that initially returns a
-// blocking picker (ErrNoSubConnAvailable) to ensure the pick method blocks and
-// waits for the picker. Only after pick() has called Pick() on the blocking
-// picker does the balancer produce a ready picker. This guarantees the
-// "Delayed LB pick complete" event is emitted reliably regardless of timing.
+// registerBlockingBalancer registers a stub balancer that wraps pickfirst and
+// intercepts its UpdateState calls. A blocking picker is pushed initially,
+// and the ready picker from pickfirst is only forwarded after Pick has been
+// called on the blocking picker. This guarantees the "Delayed LB pick
+// complete" event is emitted reliably regardless of timing.
 func registerBlockingBalancer(t *testing.T, balancerName string) {
 	t.Helper()
-	bp := &blockingPicker{pickCalled: make(chan struct{})}
-	var pickerPushed bool
+	bp := &blockingPicker{pickCalled: grpcsync.NewEvent()}
 	stub.Register(balancerName, stub.BalancerFuncs{
+		Init: func(bd *stub.BalancerData) {
+			wrapper := &blockingBalancerCCWrapper{
+				ClientConn: bd.ClientConn,
+				bp:         bp,
+			}
+			bd.ChildBalancer = balancer.Get("pick_first").Build(wrapper, bd.BuildOptions)
+		},
 		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
-			// Push the blocking picker on the first call.
-			if !pickerPushed {
-				pickerPushed = true
-				bd.ClientConn.UpdateState(balancer.State{
-					ConnectivityState: connectivity.Connecting,
-					Picker:            bp,
-				})
-			}
-
-			// Create a SubConn with the addresses from the resolver.
-			if len(ccs.ResolverState.Addresses) > 0 {
-				var subConn balancer.SubConn
-				subConn, err := bd.ClientConn.NewSubConn(ccs.ResolverState.Addresses, balancer.NewSubConnOptions{
-					StateListener: func(state balancer.SubConnState) {
-						if state.ConnectivityState == connectivity.Ready {
-							// Wait for pick() to call Pick() on the blocking
-							// picker before producing the ready picker. This
-							// ensures pickBlocked is set in picker_wrapper.go.
-							go func() {
-								<-bp.pickCalled
-								bd.ClientConn.UpdateState(balancer.State{
-									ConnectivityState: connectivity.Ready,
-									Picker:            &readyPicker{sc: subConn},
-								})
-							}()
-						}
-					},
-				})
-				if err != nil {
-					return err
-				}
-				subConn.Connect()
-			}
-			return nil
+			return bd.ChildBalancer.UpdateClientConnState(ccs)
+		},
+		Close: func(bd *stub.BalancerData) {
+			bd.ChildBalancer.Close()
 		},
 	})
 }
